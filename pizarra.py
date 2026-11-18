@@ -19,11 +19,13 @@ Teclado:
     4 / O  círculo    5 / R  rectángulo
     flechas          mover la última figura movida 1 px (Shift: 10 px)
     + / -  grosor     H  ocultar barra  Supr  borrar todo
+    T      estilo de las figuras nuevas: a mano marcado → a mano → limpio
     Ctrl+Z deshacer   Ctrl+Shift+Z / Ctrl+Y  rehacer
     Esc    salir
 """
 import math
 import os
+import random
 import signal
 import sys
 
@@ -60,6 +62,9 @@ MAX_UNDO = 200
 GRAB_RADIUS = 8  # px alrededor del borde de una figura que la agarran al instante
 HOLD_MS = 250    # tiempo pulsando dentro de una figura para agarrarla
 HOLD_SLOP = 8    # px que se puede mover el ratón mientras tanto
+# Estilo de las figuras: 0 limpio, 1 a mano, 2 a mano marcado (el nivel de «roughness»)
+STYLE_ORDER = [2, 1, 0]  # orden al pulsar T o el botón de la barra
+DEFAULT_STYLE = 2  # lo más intenso
 
 
 # ---------------------------------------------------------------- geometría
@@ -167,6 +172,136 @@ def constrain(tool, p0, p):
     return p
 
 
+# ---------------------------------------------------------------- estilo a mano
+# Versión reducida del algoritmo de rough.js (el estilo de Excalidraw): cada trazo
+# se dibuja dos veces con pequeñas desviaciones. Cada figura guarda una semilla,
+# así su forma no tiembla al redibujar y se conserva idéntica al moverla.
+
+class Rough:
+    def __init__(self, seed, roughness):
+        self.rng = random.Random(seed)
+        self.r = roughness
+
+    def off(self, x, gain=1.0):
+        """Desviación aleatoria en [-x, x], escalada por la rugosidad."""
+        return self.r * gain * (self.rng.random() * 2 * x - x)
+
+    def between(self, lo, hi):
+        return self.r * (self.rng.random() * (hi - lo) + lo)
+
+    def line(self, ops, a, b, overlay=False):
+        """Una pasada de línea a mano: Bézier con extremos desviados y algo de arco."""
+        (x1, y1), (x2, y2) = a, b
+        lsq = (x2 - x1) ** 2 + (y2 - y1) ** 2
+        length = math.sqrt(lsq)
+        if length < 200:
+            gain = 1.0
+        elif length > 500:
+            gain = 0.4
+        else:
+            gain = -0.0016668 * length + 1.233334
+        offset = 2.0
+        if offset * offset * 100 > lsq:
+            offset = length / 10
+        o = offset / 2 if overlay else offset
+        diverge = 0.2 + self.rng.random() * 0.2
+        mdx = self.off(2 * (y2 - y1) / 200, gain)
+        mdy = self.off(2 * (x1 - x2) / 200, gain)
+        r = lambda: self.off(o, gain)  # noqa: E731
+        ops.append(("M", (x1 + r(), y1 + r())))
+        ops.append(("C",
+                    (mdx + x1 + (x2 - x1) * diverge + r(), mdy + y1 + (y2 - y1) * diverge + r()),
+                    (mdx + x1 + 2 * (x2 - x1) * diverge + r(), mdy + y1 + 2 * (y2 - y1) * diverge + r()),
+                    (x2 + r(), y2 + r())))
+
+    def double_line(self, ops, a, b):
+        self.line(ops, a, b)
+        self.line(ops, a, b, overlay=True)
+
+    @staticmethod
+    def curve(ops, pts):
+        """Curva suave (Catmull-Rom) que pasa por pts[1] … pts[-2]."""
+        ops.append(("M", pts[1]))
+        for i in range(1, len(pts) - 2):
+            p0, p1, p2, p3 = pts[i - 1:i + 3]
+            ops.append(("C",
+                        (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6),
+                        (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6),
+                        p2))
+
+    def ellipse(self, ops, cx, cy, rx, ry):
+        size = math.sqrt(2 * math.pi * math.sqrt((rx * rx + ry * ry) / 2))
+        steps = math.ceil(max(9, 9 / math.sqrt(200) * size))
+        inc = 2 * math.pi / steps
+        rx += self.off(rx * 0.05)
+        ry += self.off(ry * 0.05)
+        overlap = inc * self.between(0.1, self.between(0.4, 1))
+        for o, ov in ((1, overlap), (1.5, 0)):
+            start = self.off(0.5) - math.pi / 2
+            pt = lambda k, ang: (self.off(o) + cx + k * rx * math.cos(ang),  # noqa: E731
+                                 self.off(o) + cy + k * ry * math.sin(ang))
+            pts = [pt(0.9, start - inc)]
+            ang = start
+            while ang < 2 * math.pi + start - 0.01:
+                pts.append(pt(1, ang))
+                ang += inc
+            pts += [pt(1, start + 2 * math.pi + ov * 0.5), pt(0.98, start + ov), pt(0.9, start + ov * 0.5)]
+            self.curve(ops, pts)
+
+    def rounded_rect(self, ops, x0, y0, x1, y1):
+        w, h = x1 - x0, y1 - y0
+        rad = min(0.25 * min(w, h), 32)
+        sides = [((x0 + rad, y0), (x1 - rad, y0)), ((x1, y0 + rad), (x1, y1 - rad)),
+                 ((x1 - rad, y1), (x0 + rad, y1)), ((x0, y1 - rad), (x0, y0 + rad))]
+        corners = [((x1 - rad, y0), (x1, y0), (x1, y0 + rad)),
+                   ((x1, y1 - rad), (x1, y1), (x1 - rad, y1)),
+                   ((x0 + rad, y1), (x0, y1), (x0, y1 - rad)),
+                   ((x0, y0 + rad), (x0, y0), (x0 + rad, y0))]
+        for a, b in sides:
+            self.double_line(ops, a, b)
+        if rad < 1:
+            return
+        for p0, q, p2 in corners:
+            for o in (1.0, 0.5):
+                j = lambda p: (p[0] + self.off(o), p[1] + self.off(o))  # noqa: E731
+                p0j, qj, p2j = j(p0), j(q), j(p2)
+                ops.append(("M", p0j))
+                ops.append(("C",
+                            (p0j[0] + 2 / 3 * (qj[0] - p0j[0]), p0j[1] + 2 / 3 * (qj[1] - p0j[1])),
+                            (p2j[0] + 2 / 3 * (qj[0] - p2j[0]), p2j[1] + 2 / 3 * (qj[1] - p2j[1])),
+                            p2j))
+
+
+def rough_ops(s):
+    """Trazos a mano de una figura (en caché mientras no cambie)."""
+    key = (tuple(s["pts"]), s["width"], s["rough"])
+    cached = s.get("_rough")
+    if cached and cached[0] == key:
+        return cached[1]
+    g, ops = Rough(s["seed"], s["rough"]), []
+    t, (p0, p1) = s["tool"], s["pts"]
+    if t in ("line", "arrow"):
+        g.double_line(ops, p0, p1)
+        if t == "arrow" and p0 != p1:
+            for h in arrow_head(p0, p1, s["width"]):
+                g.double_line(ops, h, p1)
+    elif t == "rect":
+        g.rounded_rect(ops, min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1]))
+    elif t == "ellipse":
+        g.ellipse(ops, *ellipse_box(p0, p1))
+    s["_rough"] = (key, ops)
+    return ops
+
+
+def draw_ops(cr, ops):
+    for op in ops:
+        if op[0] == "M":
+            cr.move_to(*op[1])
+        else:
+            cr.curve_to(*op[1], *op[2], *op[3])
+    cr.stroke()
+
+
 # ---------------------------------------------------------------- dibujo
 
 def draw_shape(cr, s):
@@ -192,6 +327,10 @@ def draw_shape(cr, s):
                             e[0], e[1])
             cr.line_to(*pts[-1])
         cr.stroke()
+        return
+
+    if s.get("rough"):
+        draw_ops(cr, rough_ops(s))
         return
 
     p0, p1 = pts
@@ -335,6 +474,7 @@ class Pizarra(Gtk.Window):
         self.tool = "pen"
         self.color = COLORS[3]  # azul
         self.width = 4
+        self.style = DEFAULT_STYLE
         self.mouse = (-100, -100)
         self.show_bar = True
         self.bar_rect = (0, 0, 0, 0)
@@ -459,7 +599,7 @@ class Pizarra(Gtk.Window):
         entries = [("tool", t, tool_s) for t in TOOLS]
         entries += [("sep", None, sep)]
         entries += [("color", c, color_s) for c in COLORS]
-        entries += [("size", None, color_s), ("sep", None, sep),
+        entries += [("size", None, color_s), ("style", None, tool_s), ("sep", None, sep),
                     ("undo", None, tool_s), ("clear", None, tool_s)]
         total = sum(e[2] for e in entries) + gap * (len(entries) - 1) + 2 * pad
         bar_h = tool_s + 2 * pad
@@ -496,10 +636,16 @@ class Pizarra(Gtk.Window):
         elif kind == "size":
             bigger = [w for w in WIDTHS if w > self.width]
             self.width = bigger[0] if bigger else WIDTHS[0]
+        elif kind == "style":
+            self.next_style()
         elif kind == "undo":
             self.undo()
         elif kind == "clear":
             self.clear()
+
+    def next_style(self):
+        i = STYLE_ORDER.index(self.style)
+        self.style = STYLE_ORDER[(i + 1) % len(STYLE_ORDER)]
 
     def draw_bar(self, cr):
         x, y, w, h = self.bar_rect
@@ -546,10 +692,12 @@ class Pizarra(Gtk.Window):
                 cr.arc(ix + s / 2, iy + s / 2, max(r, 1), 0, 2 * math.pi)
                 cr.set_source_rgb(*self.color)
                 cr.fill()
+            elif kind == "style":
+                self.draw_style_icon(cr, ix, iy, s)
             else:
                 draw_icon(cr, value if kind == "tool" else kind, ix, iy, s)
 
-        hint = "Clic der: borrar  ·  Arrastrar borde: mover  ·  Shift: recto  ·  Rueda: grosor  ·  Ctrl+Z  ·  H: barra  ·  Esc: salir"
+        hint = "Clic der: borrar  ·  Arrastrar borde: mover  ·  Shift: recto  ·  T: estilo  ·  Rueda: grosor  ·  Ctrl+Z  ·  H: barra  ·  Esc: salir"
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         cr.set_font_size(11.5)
         ext = cr.text_extents(hint)
@@ -560,6 +708,25 @@ class Pizarra(Gtk.Window):
         cr.set_source_rgba(1, 1, 1, 0.75)
         cr.move_to(tx, ty)
         cr.show_text(hint)
+
+    def draw_style_icon(self, cr, x, y, s):
+        """Una línea dibujada con el estilo activo; los puntos indican el nivel."""
+        cr.set_source_rgb(0.92, 0.92, 0.95)
+        cr.set_line_width(1.6)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        a, b = (x + s * 0.22, y + s * 0.62), (x + s * 0.78, y + s * 0.30)
+        if self.style:
+            ops = []
+            g = Rough(11, self.style * 2.5)  # exagerado: el icono es pequeño
+            g.double_line(ops, a, b)
+            draw_ops(cr, ops)
+        else:
+            cr.move_to(*a)
+            cr.line_to(*b)
+            cr.stroke()
+        for k in range(self.style):
+            cr.arc(x + s / 2 + (k - (self.style - 1) / 2) * 6, y + s * 0.80, 1.6, 0, 2 * math.pi)
+            cr.fill()
 
     # ------------------------------------------------------------ eventos
     def on_draw(self, widget, cr):
@@ -619,7 +786,8 @@ class Pizarra(Gtk.Window):
                                  "timer": GLib.timeout_add(HOLD_MS, self.on_hold)}
                 pts = [p] if self.tool == "pen" else [p, p]
                 self.current = {"tool": self.tool, "color": self.color,
-                                "width": self.width, "pts": pts}
+                                "width": self.width, "pts": pts,
+                                "rough": self.style, "seed": random.randrange(2 ** 31)}
         elif ev.button == 3:
             self.cancel_hold()
             self.erasing = True
@@ -719,6 +887,8 @@ class Pizarra(Gtk.Window):
             self.set_width(1)
         elif name in ("minus", "kp_subtract"):
             self.set_width(-1)
+        elif name == "t":
+            self.next_style()
         elif name == "h":
             self.show_bar = not self.show_bar
         elif name == "delete":
