@@ -11,8 +11,11 @@ Ratón:
     rueda            grosor del trazo
     clic izquierdo en el borde de una figura (o muy cerca) y arrastrar: moverla
     mantener pulsado dentro de una figura (sin mover el ratón) y arrastrar: moverla
+    con una figura seleccionada, arrastrar un tirador de sus esquinas (o un
+    extremo de una línea/flecha): cambiarle el tamaño
     Shift            líneas/flechas a 15°, círculo y cuadrado perfectos;
-                     al mover, solo en horizontal o en vertical
+                     al mover, solo en horizontal o en vertical;
+                     al cambiar el tamaño, mantiene la proporción (líneas a 15°)
 
 Teclado:
     1 / P  lápiz      2 / L  línea      3 / A  flecha
@@ -62,7 +65,11 @@ MAX_UNDO = 200
 GRAB_RADIUS = 8  # px alrededor del borde de una figura que la agarran al instante
 HOLD_MS = 250    # tiempo pulsando dentro de una figura para agarrarla
 HOLD_SLOP = 8    # px que se puede mover el ratón mientras tanto
+SEL_MARGIN = 6   # px entre la figura y su recuadro de selección
+HANDLE_SIZE = 9  # lado de los tiradores de las esquinas
+HANDLE_GRAB = 10 # px alrededor de un tirador que lo agarran
 # Estilo de las figuras: 0 limpio, 1 a mano, 2 a mano marcado (el nivel de «roughness»)
+HANDLE_CURSOR = {"nw": "nwse", "se": "nwse", "ne": "nesw", "sw": "nesw", 0: "point", 1: "point"}
 STYLE_ORDER = [2, 1, 0]  # orden al pulsar T o el botón de la barra
 DEFAULT_STYLE = 2  # lo más intenso
 
@@ -156,6 +163,64 @@ def translated(shape, dx, dy):
     """Copia de la figura desplazada (dx, dy). No modifica la original,
     así el historial de deshacer conserva la posición anterior."""
     return {**shape, "pts": [(x + dx, y + dy) for x, y in shape["pts"]]}
+
+
+def handles(shape):
+    """Tiradores para cambiar el tamaño: [(id, (x, y))].
+    Líneas y flechas: sus dos extremos. El resto: las esquinas del recuadro de selección."""
+    if shape["tool"] in ("line", "arrow"):
+        return [(0, shape["pts"][0]), (1, shape["pts"][1])]
+    x0, y0, x1, y1 = bbox(shape)
+    m = SEL_MARGIN
+    return [("nw", (x0 - m, y0 - m)), ("ne", (x1 + m, y0 - m)),
+            ("se", (x1 + m, y1 + m)), ("sw", (x0 - m, y1 + m))]
+
+
+def handle_at(shape, p):
+    for hid, (hx, hy) in handles(shape):
+        if math.hypot(p[0] - hx, p[1] - hy) <= HANDLE_GRAB:
+            return hid
+    return None
+
+
+def resize_start(shape, hid, p):
+    """Datos fijos de un cambio de tamaño: el punto que se mueve, el ancla
+    (lo que queda quieto) y la distancia entre el ratón y ese punto."""
+    pts = shape["pts"]
+    if hid in (0, 1):
+        moving, anchor = pts[hid], pts[1 - hid]
+    else:
+        xs, ys = [x for x, _ in pts], [y for _, y in pts]
+        bx = {"w": (min(xs), max(xs)), "e": (max(xs), min(xs))}[hid[1]]
+        by = {"n": (min(ys), max(ys)), "s": (max(ys), min(ys))}[hid[0]]
+        moving, anchor = (bx[0], by[0]), (bx[1], by[1])
+    return {"handle": hid, "moving": moving, "anchor": anchor,
+            "offset": (p[0] - moving[0], p[1] - moving[1])}
+
+
+def resized(shape, r, p, keep_ratio):
+    """Copia de la figura con el tiro r llevado al ratón p (como translated)."""
+    new = (p[0] - r["offset"][0], p[1] - r["offset"][1])
+    (mx, my), (ax, ay) = r["moving"], r["anchor"]
+    if r["handle"] in (0, 1):
+        if keep_ratio:
+            new = constrain("line", (ax, ay), new)
+        pts = list(shape["pts"])
+        pts[r["handle"]] = new
+        return {**shape, "pts": pts}
+    w0, h0 = mx - ax, my - ay
+    vx, vy = new[0] - ax, new[1] - ay
+    if keep_ratio and abs(w0) >= 1 and abs(h0) >= 1:
+        k = max(abs(vx) / abs(w0), abs(vy) / abs(h0))
+        vx, vy = math.copysign(abs(w0) * k, vx), math.copysign(abs(h0) * k, vy)
+    sx = vx / w0 if abs(w0) >= 1 else 1.0
+    sy = vy / h0 if abs(h0) >= 1 else 1.0
+    # evita aplastar la figura a 0 px (después no se podría volver a estirar)
+    if abs(w0) >= 1 and abs(sx * w0) < 2:
+        sx = math.copysign(2 / abs(w0), sx or 1)
+    if abs(h0) >= 1 and abs(sy * h0) < 2:
+        sy = math.copysign(2 / abs(h0), sy or 1)
+    return {**shape, "pts": [(ax + (x - ax) * sx, ay + (y - ay) * sy) for x, y in shape["pts"]]}
 
 
 def constrain(tool, p0, p):
@@ -473,7 +538,7 @@ class Pizarra(Gtk.Window):
         self.erased_in_drag = False
         self.tool = "pen"
         self.color = COLORS[3]  # azul
-        self.width = 4
+        self.width = WIDTHS[0]
         self.style = DEFAULT_STYLE
         self.mouse = (-100, -100)
         self.show_bar = True
@@ -507,6 +572,13 @@ class Pizarra(Gtk.Window):
         self.cursors["move"] = (Gdk.Cursor.new_from_name(display, "move")
                                 or Gdk.Cursor.new_from_name(display, "fleur")
                                 or self.cursors["default"])
+        for kind, names in (("nwse", ("nwse-resize", "nw-resize", "se-resize")),
+                            ("nesw", ("nesw-resize", "ne-resize", "sw-resize")),
+                            ("point", ("crosshair", "cell"))):
+            cur = None
+            for n in names:
+                cur = cur or Gdk.Cursor.new_from_name(display, n)
+            self.cursors[kind] = cur or self.cursors["move"]
         self.set_cursor("draw")
 
     # ------------------------------------------------------------ utilidades
@@ -560,6 +632,18 @@ class Pizarra(Gtk.Window):
         self.selected = shape
         self.drag = {"start": p, "orig": shape, "moved": False}
         self.set_cursor("move")
+
+    def handle_under(self, p):
+        """Tirador de la figura seleccionada bajo p (o None)."""
+        if self.selected_index() is None:
+            return None
+        return handle_at(self.selected, p)
+
+    def start_resize(self, hid, p):
+        self.current = None
+        self.drag = {"orig": self.selected, "moved": False,
+                     "resize": resize_start(self.selected, hid, p)}
+        self.set_cursor(HANDLE_CURSOR[hid])
 
     def cancel_hold(self):
         if self.hold:
@@ -697,7 +781,7 @@ class Pizarra(Gtk.Window):
             else:
                 draw_icon(cr, value if kind == "tool" else kind, ix, iy, s)
 
-        hint = "Clic der: borrar  ·  Arrastrar borde: mover  ·  Shift: recto  ·  T: estilo  ·  Rueda: grosor  ·  Ctrl+Z  ·  H: barra  ·  Esc: salir"
+        hint = "Clic der: borrar  ·  Arrastrar borde: mover  ·  Esquinas: tamaño  ·  Shift: recto  ·  T: estilo  ·  Rueda: grosor  ·  Ctrl+Z  ·  H: barra  ·  Esc: salir"
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         cr.set_font_size(11.5)
         ext = cr.text_extents(hint)
@@ -749,12 +833,26 @@ class Pizarra(Gtk.Window):
 
         if self.selected_index() is not None:
             x0, y0, x1, y1 = bbox(self.selected)
-            cr.rectangle(x0 - 6, y0 - 6, x1 - x0 + 12, y1 - y0 + 12)
+            m = SEL_MARGIN
+            cr.rectangle(x0 - m, y0 - m, x1 - x0 + 2 * m, y1 - y0 + 2 * m)
             cr.set_source_rgba(*ACCENT, 0.9)
             cr.set_line_width(1.5)
             cr.set_dash([6, 4])
             cr.stroke()
             cr.set_dash([])
+            # tiradores para cambiar el tamaño: círculos en los extremos de
+            # líneas y flechas, cuadrados en las esquinas del resto
+            for hid, (hx, hy) in handles(self.selected):
+                if hid in (0, 1):
+                    cr.arc(hx, hy, HANDLE_SIZE / 2 + 0.5, 0, 2 * math.pi)
+                else:
+                    rounded_rect(cr, hx - HANDLE_SIZE / 2, hy - HANDLE_SIZE / 2,
+                                 HANDLE_SIZE, HANDLE_SIZE, 2)
+                cr.set_source_rgb(1, 1, 1)
+                cr.fill_preserve()
+                cr.set_source_rgb(*ACCENT)
+                cr.set_line_width(1.5)
+                cr.stroke()
 
         if self.erasing:
             cr.arc(*self.mouse, ERASER_RADIUS, 0, 2 * math.pi)
@@ -774,6 +872,11 @@ class Pizarra(Gtk.Window):
             return True  # ignora doble/triple clic
         p = (ev.x, ev.y)
         if ev.button == 1:
+            hid = None if self.in_bar(p) else self.handle_under(p)
+            if hid is not None:
+                self.start_resize(hid, p)  # tirador de la figura seleccionada
+                widget.queue_draw()
+                return True
             self.selected = None
             if self.in_bar(p):
                 self.click_bar(p)
@@ -812,6 +915,16 @@ class Pizarra(Gtk.Window):
                 if ev.state & Gdk.ModifierType.SHIFT_MASK:
                     p = constrain(cur["tool"], cur["pts"][0], p)
                 cur["pts"][1] = p
+        elif self.drag and "resize" in self.drag:
+            d = self.drag
+            i = self.selected_index()
+            if i is not None:
+                if not d["moved"]:
+                    self.snapshot()
+                    d["moved"] = True
+                self.shapes = list(self.shapes)
+                self.selected = self.shapes[i] = resized(
+                    d["orig"], d["resize"], p, ev.state & Gdk.ModifierType.SHIFT_MASK)
         elif self.drag:
             d = self.drag
             dx, dy = p[0] - d["start"][0], p[1] - d["start"][1]
@@ -831,6 +944,8 @@ class Pizarra(Gtk.Window):
             self.erase_at(p)
         elif self.in_bar(p):
             self.set_cursor("default")
+        elif (hid := self.handle_under(p)) is not None:
+            self.set_cursor(HANDLE_CURSOR[hid])
         else:
             self.set_cursor("move" if self.shape_near(p) is not None else "draw")
         widget.queue_draw()
